@@ -8,9 +8,23 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = new Set(['image/jpeg', 'image/png', 'image/webp']);
+    cb(null, allowed.has(file.mimetype));
+  },
+});
 const db = new Database(process.env.DATABASE_PATH || './freshers.db');
-const authTokens = new Set();
+const authTokens = new Map();
+const loginAttempts = new Map();
+const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const MEDIA_KEYS = new Set(['heroImage', 'danceImage', 'dramaImage', 'singingImage', 'logo']);
+
+if (process.env.NODE_ENV === 'production' && (!process.env.ORGANISER_ID || !process.env.ORGANISER_PASSWORD)) {
+  throw new Error('ORGANISER_ID and ORGANISER_PASSWORD must be configured in production.');
+}
 
 app.use(express.json({ limit: '2mb' }));
 db.pragma('journal_mode = WAL');
@@ -118,8 +132,10 @@ const getMediaMap = () => {
 };
 
 const auth = (req, res, next) => {
-  const token = (req.headers.authorization || '').replace('Bearer ', '');
-  if (!token || !authTokens.has(token)) {
+  const token = (req.headers.authorization || '').replace(/^Bearer\\s+/i, '');
+  const session = token ? authTokens.get(token) : null;
+  if (!session || session.expiresAt <= Date.now()) {
+    if (token) authTokens.delete(token);
     return res.status(401).json({ error: 'Unauthorised' });
   }
   next();
@@ -134,6 +150,9 @@ app.get('/api/public', (req, res) => {
 });
 
 app.get('/api/media/:key', (req, res) => {
+  if (!MEDIA_KEYS.has(req.params.key)) {
+    return res.status(404).json({ error: 'Media not found' });
+  }
   const row = db.prepare('SELECT mime, data FROM media WHERE key = ?').get(req.params.key);
   if (!row) {
     return res.status(404).json({ error: 'Media not found' });
@@ -165,6 +184,9 @@ app.post('/api/passes', (req, res) => {
   }
 
   const price = Number(getSettings().passPrice || 499);
+  if (!Number.isInteger(price) || price < 0 || price > 100000) {
+    return res.status(500).json({ error: 'Invalid server-side pass price configuration.' });
+  }
   const normalizedCoupon = String(coupon || '').trim().toUpperCase();
   const discount = normalizedCoupon === 'FRESHER50' ? Math.round(price * 0.5) : 0;
 
@@ -180,8 +202,8 @@ app.post('/api/passes', (req, res) => {
       amount: price - discount,
       original: price,
       discount,
-      passCode,
-      message: 'Registration saved. Razorpay keys can be configured later for payment verification.',
+      paymentStatus: 'PENDING',
+      message: 'Registration saved. A pass code is issued only after payment is verified by the server.',
     });
   } catch (error) {
     res.status(409).json({ error: 'A pass already exists for this registration number.' });
@@ -194,20 +216,44 @@ app.post('/api/retrieve', (req, res) => {
   if (!pass) {
     return res.status(404).json({ error: 'Pass not found. Check your registration number and pass code.' });
   }
-  res.json({ pass, settings: getSettings() });
+  const safePass = {
+    id: pass.id,
+    name: pass.name,
+    registration: pass.registration,
+    branch: pass.branch,
+    type: pass.type,
+    pass_code: pass.pass_code,
+    qr_token: pass.payment_status === 'PAID' ? pass.qr_token : null,
+    payment_status: pass.payment_status,
+    status: pass.status,
+    price: pass.price,
+    discount: pass.discount,
+    created_at: pass.created_at,
+    used_at: pass.used_at,
+  };
+  res.json({ pass: safePass, settings: getSettings() });
 });
 
 app.post('/api/organiser/login', (req, res) => {
-  const organiserId = process.env.ORGANISER_ID || 'NIKHIL_2515082';
-  const organiserPassword = process.env.ORGANISER_PASSWORD || '11856';
+  const organiserId = process.env.ORGANISER_ID;
+  const organiserPassword = process.env.ORGANISER_PASSWORD;
+  const key = req.ip || 'unknown';
+  const now = Date.now();
+  const attempts = loginAttempts.get(key) || [];
+  const recent = attempts.filter((time) => now - time < 15 * 60 * 1000);
+  if (recent.length >= 5) {
+    return res.status(429).json({ error: 'Too many login attempts. Try again later.' });
+  }
+  recent.push(now);
+  loginAttempts.set(key, recent);
 
-  if (req.body.id !== organiserId || req.body.password !== organiserPassword) {
+  if (!organiserId || !organiserPassword || req.body.id !== organiserId || req.body.password !== organiserPassword) {
     return res.status(401).json({ error: 'Invalid organiser credentials.' });
   }
 
   const token = crypto.randomBytes(32).toString('hex');
-  authTokens.add(token);
-  res.json({ token });
+  authTokens.set(token, { expiresAt: now + SESSION_TTL_MS });
+  res.json({ token, expiresIn: SESSION_TTL_MS });
 });
 
 app.get('/api/admin/content', auth, (req, res) => {
@@ -231,7 +277,7 @@ app.patch('/api/admin/settings', auth, (req, res) => {
 
 app.post('/api/admin/media/:key', auth, upload.single('image'), (req, res) => {
   if (!req.file) {
-    return res.status(400).json({ error: 'Image required.' });
+    return res.status(400).json({ error: 'A JPEG, PNG, or WebP image under 2 MB is required.' });
   }
 
   const payload = req.file.buffer.toString('base64');
@@ -289,6 +335,9 @@ app.post('/api/scanner/validate', auth, (req, res) => {
   if (!pass) {
     return res.status(404).json({ error: 'Pass not found.' });
   }
+  if (pass.payment_status !== 'PAID') {
+    return res.status(402).json({ error: 'PAYMENT NOT VERIFIED.' });
+  }
   res.json({ pass });
 });
 
@@ -300,7 +349,10 @@ app.post('/api/scanner/use', auth, (req, res) => {
   if (pass.status === 'USED') {
     return res.status(409).json({ error: 'PASS ALREADY USED', pass });
   }
-  db.prepare("UPDATE passes SET status = 'USED', used_at = CURRENT_TIMESTAMP WHERE id = ?").run(pass.id);
+  const result = db.prepare("UPDATE passes SET status = 'USED', used_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'UNUSED' AND payment_status = 'PAID'").run(pass.id);
+  if (result.changes !== 1) {
+    return res.status(409).json({ error: 'PASS IS NOT ELIGIBLE FOR USE.' });
+  }
   const updated = db.prepare('SELECT * FROM passes WHERE id = ?').get(pass.id);
   res.json({ pass: updated });
 });
